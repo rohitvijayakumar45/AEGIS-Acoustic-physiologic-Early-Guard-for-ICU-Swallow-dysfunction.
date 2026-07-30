@@ -3,131 +3,145 @@ import logging
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import train_test_split
-from scipy.stats import entropy
-from sklearn.ensemble import RandomForestClassifier
+import pickle
+import joblib
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from scipy.stats import entropy, ks_2samp
+from clinical_evaluation import TemperatureScaling
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_femh(path: Path):
-    logger.info(f"Load FEMH from {path}")
-    # codebook_file = path / "codebook.xlsx"
-    # Dummy load. Real implementation needs specific feature extraction pipeline.
-    features = np.random.randn(100, 50)
-    labels = np.random.randint(0, 2, 100)
+def load_swallowing_data(data_path: Path):
+    """Load external swallowing dataset. Fallback to mock data if data.csv not found."""
+    data_file = data_path / "data.csv"
+    if not data_file.exists():
+        logger.warning(f"Dataset not found at {data_file}. Generating mock external validation data for pipeline testing.")
+        # Generate mock features matching the training feature list roughly
+        # In a real scenario, this would parse the specific external dataset structure
+        import json
+        config_path = Path("C:/Users/rohit/MultiModal/AEGIS/data/models/training_config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        feature_list = config['feature_list']
+        X = np.random.randn(100, len(feature_list))
+        y = np.random.randint(0, 2, 100)
+        
+        # Introduce a deliberate domain shift (e.g. shift the mean of features)
+        X = X + 0.5 
+        
+        df = pd.DataFrame(X, columns=feature_list)
+        return df, y
+        
+    df = pd.read_csv(data_file)
+    labels = df['label']
+    features = df.drop(columns=['label'])
     return features, labels
 
-def load_svd(path: Path):
-    logger.info(f"Load SVD from {path}")
-    # Dummy load.
-    features = np.random.randn(150, 50)
-    labels = np.random.randint(0, 2, 150)
-    return features, labels
-
-def load_swallowing_data(path: Path):
-    logger.info(f"Load Swallowing_data from {path}")
-    labels_dir = path / "labels"
-    signals_dir = path / "signals"
+def check_domain_shift(source_df: pd.DataFrame, target_df: pd.DataFrame):
+    logger.info("Compute domain shift.")
+    missing_features = list(set(source_df.columns) - set(target_df.columns))
     
-    # Process NPY and CSVs here.
-    # Dummy load for template.
-    features = np.random.randn(200, 50)
-    labels = np.random.randint(0, 2, 200)
-    return features, labels
-
-def load_external_dataset(dataset_name: str, dataset_path: Path):
-    if dataset_name == "FEMH":
-        return load_femh(dataset_path)
-    elif dataset_name == "SVD":
-        return load_svd(dataset_path)
-    elif dataset_name == "Swallowing_data":
-        return load_swallowing_data(dataset_path)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-def evaluate_frozen_model(model, features, labels):
-    logger.info("Eval frozen model.")
-    if hasattr(model, "predict"):
-        preds = model.predict(features)
-        acc = accuracy_score(labels, preds)
-        f1 = f1_score(labels, preds, average='macro')
-        return {"accuracy": float(acc), "f1": float(f1)}
-    return {"accuracy": 0.0, "f1": 0.0}
-
-def evaluate_with_adaptation(model, features, labels):
-    logger.info("Eval with adaptation.")
-    X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.8, random_state=42)
-    if hasattr(model, "fit"):
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-        f1 = f1_score(y_test, preds, average='macro')
-        return {"accuracy": float(acc), "f1": float(f1)}
-    return {"accuracy": 0.0, "f1": 0.0}
-
-def normalize_features(source_features, target_features):
-    logger.info("Normalize target features with source stats.")
-    mean = np.mean(source_features, axis=0)
-    std = np.std(source_features, axis=0)
-    std[std == 0] = 1e-6
-    return (target_features - mean) / std
-
-def check_domain_shift(source_features, target_features):
-    logger.info("Compute domain shift (KL div).")
-    def _to_prob(feats):
-        hist, _ = np.histogram(feats.flatten(), bins=50, density=True)
-        hist = hist + 1e-8
-        return hist / np.sum(hist)
-    
-    p = _to_prob(source_features)
-    q = _to_prob(target_features)
-    kl_div = entropy(p, q)
-    return {"kl_divergence": float(kl_div)}
+    shifts = {}
+    for col in source_df.columns:
+        if col in target_df.columns:
+            # KS test for distribution shift
+            stat, pval = ks_2samp(source_df[col].dropna(), target_df[col].dropna())
+            shifts[col] = {"ks_stat": float(stat), "p_value": float(pval)}
+            
+    return {
+        "missing_features": missing_features,
+        "distribution_shifts": shifts
+    }
 
 def main():
-    base_out = Path(r"c:\Users\rohit\MultiModal\AEGIS\data\models")
-    base_out.mkdir(parents=True, exist_ok=True)
+    models_dir = Path(r"c:\Users\rohit\MultiModal\AEGIS\data\models")
+    models_dir.mkdir(parents=True, exist_ok=True)
     
-    datasets = {
-        "FEMH": Path(r"c:\Users\rohit\MultiModal\dataset\FEMH"),
-        "SVD": Path(r"c:\Users\rohit\MultiModal\dataset\SVD_data\SVD"),
-        "Swallowing_data": Path(r"c:\Users\rohit\MultiModal\dataset\Swallowing_data\Swallowing data")
-    }
-    
-    # Mock source model/data
-    source_features = np.random.randn(1000, 50)
-    model = RandomForestClassifier(random_state=42)
-    model.fit(source_features, np.random.randint(0, 2, 1000))
-    
-    results = {}
-    
-    for name, path in datasets.items():
-        try:
-            feats, labels = load_external_dataset(name, path)
-            norm_feats = normalize_features(source_features, feats)
-            shift = check_domain_shift(source_features, feats)
-            
-            frozen_res = evaluate_frozen_model(model, norm_feats, labels)
-            
-            # Re-init model for fresh adaptation
-            adapt_model = RandomForestClassifier(random_state=42)
-            adapt_res = evaluate_with_adaptation(adapt_model, norm_feats, labels)
-            
-            results[name] = {
-                "domain_shift": shift,
-                "frozen_metrics": frozen_res,
-                "adapted_metrics": adapt_res
-            }
-        except Exception as e:
-            logger.error(f"Error processing {name}: {e}")
-            
-    out_file = base_out / "external_validation_results.json"
-    with open(out_file, "w") as f:
-        json.dump(results, f, indent=4)
+    # 1. Load xgboost_baseline.pkl
+    xgb_path = models_dir / "xgboost_baseline.pkl"
+    logger.info(f"Load {xgb_path}")
+    if not xgb_path.exists():
+        raise FileNotFoundError(f"{xgb_path} not found.")
+    model = joblib.load(xgb_path)
         
-    logger.info(f"Save results to {out_file}")
+    # 2. Load Temperature Scaling (TS) calibrator
+    ts_path = models_dir / "XGBoost_calibrator.pkl"
+    logger.info(f"Load {ts_path}")
+    if not ts_path.exists():
+        raise FileNotFoundError(f"{ts_path} not found.")
+    ts_model = joblib.load(ts_path)
+
+    # 3. Load operating_points.json
+    op_path = models_dir / "operating_points.json"
+    logger.info(f"Load {op_path}")
+    if not op_path.exists():
+        raise FileNotFoundError(f"{op_path} not found.")
+    with open(op_path, "r") as f:
+        operating_points = json.load(f)
+
+    # 4. Load Swallowing_data dataset
+    swallowing_path = Path(r"c:\Users\rohit\MultiModal\dataset\Swallowing_data\Swallowing data")
+    features, labels = load_swallowing_data(swallowing_path)
+
+    # 5. Normalize using training stats
+    stats_path = models_dir / "training_stats.json"
+    if not stats_path.exists():
+        logger.warning(f"{stats_path} not found. Skipping explicit normalization (tree models are scale-invariant, deep models use their own norm layers if present).")
+    else:
+        with open(stats_path, "r") as f:
+            train_stats = json.load(f)
+        logger.info("Normalize using training stats.")
+        for col in features.columns:
+            if col in train_stats:
+                mean = train_stats[col]['mean']
+                std = train_stats[col]['std']
+                features[col] = (features[col] - mean) / (std + 1e-6)
+
+    # Mimic-IV features (loading from actual dataset instead of synthetic)
+    mimic_path = Path(r"c:\Users\rohit\MultiModal\dataset\MIMIC-IV\mimic_features.csv")
+    if not mimic_path.exists():
+        logger.warning(f"MIMIC-IV features not found at {mimic_path}. Generating mock MIMIC-IV validation data for domain shift report.")
+        # Generate mock MIMIC features
+        X_mimic = np.random.randn(100, len(features.columns))
+        mimic_features = pd.DataFrame(X_mimic, columns=features.columns)
+    else:
+        mimic_features = pd.read_csv(mimic_path).drop(columns=['label'], errors='ignore')
+        
+    logger.info("Generate domain shift report.")
+    domain_shift = check_domain_shift(mimic_features, features)
+    report_file = models_dir / "domain_shift_report.json"
+    with open(report_file, "w") as f:
+        json.dump(domain_shift, f, indent=4)
+    logger.info(f"Saved {report_file}")
+
+    logger.info("Infer external dataset.")
+    if hasattr(model, "predict_proba"):
+        probs = model.predict_proba(features)[:, 1]
+    else:
+        probs = model.predict(features)
+        
+    # Calibrate
+    if hasattr(ts_model, "predict_proba"):
+        probs = ts_model.predict_proba(probs.reshape(-1, 1))
+        
+    threshold = operating_points.get("default_threshold", 0.5)
+    preds = (probs >= threshold).astype(int)
+
+    # 7. Report metrics
+    acc = accuracy_score(labels, preds)
+    f1 = f1_score(labels, preds, average='macro')
+    try:
+        auc = roc_auc_score(labels, probs)
+    except ValueError:
+        auc = 0.5
+    
+    metrics = {"accuracy": acc, "f1": f1, "auc": auc}
+    logger.info(f"Metrics: {metrics}")
+    
+    metrics_file = models_dir / "external_validation_metrics.json"
+    with open(metrics_file, "w") as f:
+        json.dump(metrics, f, indent=4)
 
 if __name__ == "__main__":
     main()

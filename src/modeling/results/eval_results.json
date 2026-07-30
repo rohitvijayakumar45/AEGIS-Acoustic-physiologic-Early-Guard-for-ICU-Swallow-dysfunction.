@@ -1,0 +1,51 @@
+{
+    "brier_score": 0.04787702527015365,
+    "auroc": {
+        "point": 0.970335447524765,
+        "lower_ci": 0.9593276011617279,
+        "upper_ci": 0.9795247181015929
+    },
+    "delong": {
+        "z": 4.667671557191711,
+        "p": 3.0463235878297468e-06
+    },
+    "mcnemar": {
+        "stat": 0.9615384615384616,
+        "p": 0.3267995676689632
+    },
+    "simulation": {
+        "alert_precision": 0.6535714285714286,
+        "avg_alerts_per_stay": 1.1428571428571428,
+        "median_warning_time_hr": 0.0,
+        "alarm_burden_per_8h_shift": 2.24
+    },
+    "subgroups": {
+        "overall_auroc": 0.9668504821234764,
+        "subgroups": {
+            "age_bin": {
+                "young": {
+                    "auroc": null,
+                    "n_samples": 489,
+                    "flag_drop": false
+                },
+                "old": {
+                    "auroc": null,
+                    "n_samples": 511,
+                    "flag_drop": false
+                }
+            },
+            "sex": {
+                "M": {
+                    "auroc": null,
+                    "n_samples": 500,
+                    "flag_drop": false
+                },
+                "F": {
+                    "auroc": null,
+                    "n_samples": 500,
+                    "flag_drop": false
+                }
+            }
+        }
+    }
+}

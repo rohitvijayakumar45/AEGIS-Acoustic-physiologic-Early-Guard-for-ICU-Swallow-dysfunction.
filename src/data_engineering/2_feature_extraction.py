@@ -81,11 +81,12 @@ def main():
         windowed AS (
             SELECT
                 subject_id, hadm_id, stay_id, signal, valuenum, time_hrs,
-                CAST(FLOOR(time_hrs / 4.0) AS INT) as window
+                CAST(FLOOR(time_hrs / 4.0) AS INTEGER) as win_id
             FROM time_calc
         )
         SELECT
-            subject_id, hadm_id, stay_id, window, signal,
+            subject_id, hadm_id, stay_id, win_id,
+            signal,
             AVG(valuenum) as mean,
             MIN(valuenum) as min_val,
             MAX(valuenum) as max_val,
@@ -93,12 +94,12 @@ def main():
             COUNT(valuenum) as obs_count,
             COALESCE(REGR_SLOPE(valuenum, time_hrs), 0) as slope
         FROM windowed
-        GROUP BY subject_id, hadm_id, stay_id, window, signal
+        GROUP BY subject_id, hadm_id, stay_id, win_id, signal
     """
     aggs = conn.execute(query_agg).df()
 
     logging.info("Pivot to wide format.")
-    index_cols = ['subject_id', 'hadm_id', 'stay_id', 'window']
+    index_cols = ['subject_id', 'hadm_id', 'stay_id', 'win_id']
     wide = aggs.pivot_table(index=index_cols, columns='signal',
                             values=['mean', 'min_val', 'max_val', 'std', 'obs_count', 'slope'],
                             aggfunc='first')

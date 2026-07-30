@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 import json
+import os
+import subprocess
+import joblib
 from pathlib import Path
 from sklearn.metrics import (
     brier_score_loss, confusion_matrix, precision_recall_curve,
@@ -166,6 +169,8 @@ def main():
         ts.fit(y_val, p_val)
         scalers[m] = ts
         
+        joblib.dump(ts, out_dir / f"{m}_calibrator.pkl")
+        
         p_val_cal = ts.predict_proba(p_val)
         calibrated_val[m] = p_val_cal
         
@@ -266,7 +271,39 @@ def main():
             
     summary_df = pd.DataFrame(summary_data)
     summary_df.to_csv(out_dir / "threshold_summary_table.csv", index=False)
-    print("Clinical evaluation complete.")
+    
+    try:
+        git_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=data_dir.parent).decode('utf-8').strip()
+    except Exception:
+        git_hash = "unknown"
+        
+    manifest = {
+        "git_commit": git_hash,
+        "models": {},
+        "thresholds": str(out_dir / "operating_points.json"),
+        "calibrators": {}
+    }
+    
+    for model_file in ["xgboost_baseline.pkl", "lstm_baseline.pt"]:
+        model_path = out_dir / model_file
+        if model_path.exists():
+            manifest["models"][model_file] = {
+                "path": str(model_path),
+                "size_bytes": model_path.stat().st_size
+            }
+            
+    for m in scalers.keys():
+        cal_path = out_dir / f"{m}_calibrator.pkl"
+        if cal_path.exists():
+            manifest["calibrators"][m] = {
+                "path": str(cal_path),
+                "size_bytes": cal_path.stat().st_size
+            }
+            
+    with open(out_dir / "experiment_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=4)
+        
+    print("Clinical evaluation complete. Manifest exported.")
 
 if __name__ == "__main__":
     main()

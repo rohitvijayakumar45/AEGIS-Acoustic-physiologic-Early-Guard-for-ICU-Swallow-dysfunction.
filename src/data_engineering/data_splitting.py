@@ -41,7 +41,7 @@ def get_admission_data(admissions_path: Path, features_path: Path) -> pd.DataFra
                 subject_id, 
                 hadm_id, 
                 stay_id, 
-                EXTRACT(YEAR FROM MIN(window_end_time)) as admission_year
+                EXTRACT(YEAR FROM MIN(charttime)) as admission_year
             FROM '{str(features_path).replace("\\", "/")}'
             GROUP BY subject_id, hadm_id, stay_id
         """
@@ -133,7 +133,7 @@ def validate_split(df: pd.DataFrame):
         logging.info(f"  Stays: {n_stays}")
         
 def main():
-    admissions_path = Path(r"C:\Users\rohit\MultiModal\dataset\mimic-iv-3.1-20260514T144455Z-3-005\mimic-iv-3.1\hosp\admissions.csv.gz")
+    admissions_path = Path(r"C:\Users\rohit\MultiModal\dataset\mimic-iv-3.1-20260514T144455Z-3-004\mimic-iv-3.1\hosp\admissions.csv.gz")
     features_path = Path(r"C:\Users\rohit\MultiModal\AEGIS\data\processed\physiological_features.parquet")
     output_path = Path(r"C:\Users\rohit\MultiModal\AEGIS\data\processed\split_assignments.csv")
     

@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
+import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -490,9 +491,12 @@ def main(max_rows=None, epochs=10, n_trials=20):
     results["Random Forest"] = evaluate_model(y_test, preds_rf, test_df["stay_id"].values, "test", "Random Forest")
     
     # 4. XGBoost
-    preds_xgb_val = train_xgboost(X_train, y_train, groups_train, X_val, n_trials)
+    best_xgb_params = optimize_xgboost(X_train, y_train, groups_train, n_trials)
+    xgb_model = xgb.XGBClassifier(**best_xgb_params)
+    xgb_model.fit(X_train, y_train)
+    preds_xgb_val = xgb_model.predict_proba(X_val)[:, 1]
     evaluate_model(y_val, preds_xgb_val, val_df["stay_id"].values, "val", "XGBoost")
-    preds_xgb = train_xgboost(X_train, y_train, groups_train, X_test, n_trials)
+    preds_xgb = xgb_model.predict_proba(X_test)[:, 1]
     results["XGBoost"] = evaluate_model(y_test, preds_xgb, test_df["stay_id"].values, "test", "XGBoost")
     
     # 5. LightGBM
@@ -521,10 +525,11 @@ def main(max_rows=None, epochs=10, n_trials=20):
         
         preds_test, y_test_dl, stay_ids_test = evaluate_dl_model(trained, test_loader)
         results[name] = evaluate_model(y_test_dl, preds_test, stay_ids_test, "test", name)
+        return trained
 
     # 6. LSTM
     lstm_model = LSTMModel(input_dim=len(feature_cols))
-    run_dl("LSTM", lstm_model, use_focal=True)
+    lstm_trained = run_dl("LSTM", lstm_model, use_focal=True)
     
     # 7. TCN
     tcn_model = TCNModel(input_size=len(feature_cols), num_channels=[64, 64, 64])
@@ -533,6 +538,19 @@ def main(max_rows=None, epochs=10, n_trials=20):
     # Save results
     out_dir = DATA_DIR / "models"
     out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save best models
+    joblib.dump(xgb_model, out_dir / "xgboost_baseline.pkl")
+    torch.save(lstm_trained, out_dir / "lstm_baseline.pt")
+    
+    # Save training config
+    training_config = {
+        "seed": SEED,
+        "feature_list": feature_cols,
+        "xgboost_best_params": best_xgb_params
+    }
+    with open(out_dir / "training_config.json", "w") as f:
+        json.dump(training_config, f, indent=4)
     
     out_path = out_dir / "baseline_results.json"
     with open(out_path, "w") as f:

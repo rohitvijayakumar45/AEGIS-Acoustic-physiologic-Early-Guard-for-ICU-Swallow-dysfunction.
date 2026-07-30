@@ -1,56 +1,88 @@
 import os
 import numpy as np
-import torch
-import torch.nn as nn
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import shap
-from captum.attr import IntegratedGradients
+import json
+import joblib
+import duckdb
 from pathlib import Path
 
-def plot_feature_importance(importances, feature_names, save_path, title="Feature Importance"):
-    """Plot generic bar chart."""
-    plt.figure(figsize=(10, 6))
-    indices = np.argsort(np.abs(importances))
-    plt.barh(range(len(indices)), importances[indices], align="center")
-    plt.yticks(range(len(indices)), [feature_names[i] for i in indices])
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-def top_k_features(attributions, feature_names, k=5):
-    """Return top-k contributing features."""
-    indices = np.argsort(np.abs(attributions))[::-1][:k]
-    return [(feature_names[i], attributions[i]) for i in indices]
+def load_data_for_explanation():
+    processed_dir = Path("C:/Users/rohit/MultiModal/AEGIS/data/processed")
+    features_df = pd.read_parquet(processed_dir / "physiological_features.parquet")
+    labels_df = pd.read_csv(processed_dir / "ground_truth_labels.csv")
+    splits_df = pd.read_csv(processed_dir / "split_assignments.csv")
+    cohort_path = "C:/Users/rohit/MultiModal/AEGIS/data/processed/target_cohort.csv"
+    
+    conn = duckdb.connect()
+    conn.register("features_df", features_df)
+    conn.register("labels_df", labels_df)
+    conn.register("splits_df", splits_df)
+    
+    query = f"""
+    WITH cohort AS (
+        SELECT stay_id, CAST(intime AS TIMESTAMP) as intime
+        FROM read_csv_auto('{cohort_path}')
+    ),
+    features_with_time AS (
+        SELECT f.*, 
+               c.intime + INTERVAL (f.win_id * 4) HOUR as window_end_time
+        FROM features_df f
+        JOIN cohort c ON f.stay_id = c.stay_id
+    ),
+    joined AS (
+        SELECT 
+            f.*,
+            s.split,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM labels_df l
+                WHERE l.stay_id = f.stay_id 
+                  AND TRY_CAST(l.event_time AS TIMESTAMP) >= f.window_end_time 
+                  AND TRY_CAST(l.event_time AS TIMESTAMP) <= f.window_end_time + INTERVAL 4 HOUR
+            ) THEN 1 ELSE 0 END as target
+        FROM features_with_time f
+        JOIN splits_df s ON f.stay_id = s.stay_id
+    )
+    SELECT * FROM joined
+    """
+    df = conn.execute(query).df()
+    
+    feature_cols = [
+        col for col in df.columns 
+        if col.endswith(("_mean", "_min_val", "_max_val", "_std", "_slope", "_obs_count"))
+    ]
+    derived_flags = ["spo2_drop_flag", "tachypnea_flag", "bradycardia_flag", "fever_flag"]
+    feature_cols.extend([col for col in derived_flags if col in df.columns])
+    
+    df[feature_cols] = df[feature_cols].fillna(0)
+    
+    test_df = df[df["split"] == "test"].copy()
+    return test_df, feature_cols
 
 def explain_tree_model(model, X_test, feature_names, save_path):
-    """Explain tabular models using TreeSHAP."""
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
     
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_test)
     
-    # Handle list return for some models (e.g., RandomForest classifier)
     if isinstance(shap_values, list):
-        shap_values = shap_values[1] # Assume binary classification, take positive class
+        shap_values = shap_values[1]
         
     np.save(save_path / "shap_values.npy", shap_values)
     
-    # Summary plot
     plt.figure()
     shap.summary_plot(shap_values, X_test, feature_names=feature_names, show=False)
     plt.savefig(save_path / "shap_summary.png", bbox_inches='tight')
     plt.close()
     
-    # Bar plot
     plt.figure()
     shap.summary_plot(shap_values, X_test, feature_names=feature_names, plot_type="bar", show=False)
     plt.savefig(save_path / "shap_bar.png", bbox_inches='tight')
     plt.close()
     
-    # Top 5 dependence plots
     global_importances = np.abs(shap_values).mean(axis=0)
     top_indices = np.argsort(global_importances)[::-1][:5]
     for idx in top_indices:
@@ -61,103 +93,54 @@ def explain_tree_model(model, X_test, feature_names, save_path):
         
     return shap_values
 
-def explain_deep_model(model, X_test, feature_names, save_path, target_class=1):
-    """Explain deep models using Integrated Gradients."""
+def generate_json_rankings(shap_vals, X_test, df_test, feature_names, save_path):
     save_path = Path(save_path)
-    save_path.mkdir(parents=True, exist_ok=True)
+    rankings = []
     
-    model.eval()
-    if not isinstance(X_test, torch.Tensor):
-        X_test = torch.tensor(X_test, dtype=torch.float32)
+    X_test_vals = X_test.values
+    stay_ids = df_test["stay_id"].values
+    
+    for i in range(len(X_test)):
+        pat_shap = shap_vals[i]
+        indices = np.argsort(np.abs(pat_shap))[::-1][:5]
         
-    X_test.requires_grad_()
-    
-    ig = IntegratedGradients(model)
-    attributions = ig.attribute(X_test, target=target_class)
-    attr_np = attributions.detach().cpu().numpy()
-    
-    # Heatmap
-    plt.figure(figsize=(12, 8))
-    sns.heatmap(attr_np, xticklabels=feature_names, cmap="coolwarm", center=0)
-    plt.title("Integrated Gradients Attributions Heatmap")
-    plt.xlabel("Features")
-    plt.ylabel("Samples")
-    plt.tight_layout()
-    plt.savefig(save_path / "ig_heatmap.png")
-    plt.close()
-    
-    # Feature Importance Bar
-    global_attr = np.mean(attr_np, axis=0)
-    plot_feature_importance(global_attr, feature_names, save_path / "ig_bar.png", "IG Feature Importance")
-    
-    return attr_np
-
-def generate_patient_report(patient_id, prediction, attributions, feature_names, feature_values):
-    """Output human-readable text explaining the prediction."""
-    risk_level = "HIGH RISK" if prediction > 0.5 else "LOW RISK"
-    top_features = top_k_features(attributions, feature_names, k=3)
-    
-    drivers = []
-    for name, attr in top_features:
-        idx = feature_names.index(name)
-        val = feature_values[idx]
-        drivers.append(f"{name} (val: {val:.2f}, attr: {attr:.2f})")
+        drivers = []
+        for idx in indices:
+            drivers.append({
+                "feature": feature_names[idx],
+                "value": float(X_test_vals[i, idx]),
+                "importance": float(pat_shap[idx])
+            })
+            
+        # Convert types for json
+        s_id = int(stay_ids[i]) if hasattr(stay_ids[i], "item") else stay_ids[i]
         
-    drivers_str = ", ".join(drivers)
-    report = f"Patient {patient_id}: {risk_level} ({prediction:.2f}). Primary drivers: {drivers_str}."
-    return report
+        rankings.append({
+            "stay_id": s_id,
+            "win_id": int(df_test.iloc[i]["win_id"]),
+            "top_features": drivers
+        })
+        
+    with open(save_path / "explainability_rankings.json", "w") as f:
+        json.dump(rankings, f, indent=4)
 
 def main():
-    """Synthetic demo."""
-    import xgboost as xgb
+    print("Loading data...")
+    test_df, feature_names = load_data_for_explanation()
+    X_test = test_df[feature_names]
     
-    print("Running explainability demo...")
-    np.random.seed(42)
-    torch.manual_seed(42)
+    print("Loading XGBoost model...")
+    model_path = Path("C:/Users/rohit/MultiModal/AEGIS/data/models/xgboost_baseline.pkl")
+    model = joblib.load(model_path)
     
-    # Synthetic data
-    N = 100
-    D = 10
-    feature_names = [f"Feature_{i}" for i in range(D)]
-    feature_names[0] = "SpO2"
-    feature_names[1] = "RR"
-    feature_names[2] = "GCS"
+    save_dir = Path("C:/Users/rohit/MultiModal/AEGIS/data/models")
+    save_dir.mkdir(parents=True, exist_ok=True)
     
-    X = np.random.randn(N, D)
-    y = (X[:, 0] * -1.5 + X[:, 1] * 1.2 + X[:, 2] * -0.8 + np.random.randn(N) * 0.5 > 0).astype(int)
-    
-    # 1. TreeSHAP Demo
-    tree_dir = Path("./demo_output/tree")
-    tree_model = xgb.XGBClassifier(n_estimators=10, random_state=42)
-    tree_model.fit(X, y)
-    print("Tree model fitted. Generating SHAP explanations...")
-    shap_vals = explain_tree_model(tree_model, X, feature_names, tree_dir)
-    print(f"SHAP saved to {tree_dir}")
-    
-    # 2. Integrated Gradients Demo
-    deep_dir = Path("./demo_output/deep")
-    class SimpleNN(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(D, 16)
-            self.fc2 = nn.Linear(16, 2) # output classes
-            
-        def forward(self, x):
-            x = torch.relu(self.fc1(x))
-            return self.fc2(x)
-            
-    nn_model = SimpleNN()
-    print("Deep model initialized. Generating IG explanations...")
-    ig_vals = explain_deep_model(nn_model, X, feature_names, deep_dir, target_class=1)
-    print(f"IG saved to {deep_dir}")
-    
-    # 3. Patient Report Demo
-    idx = 0
-    pred = 0.91 # Mock prediction
-    patient_id = "P10293"
-    report = generate_patient_report(patient_id, pred, shap_vals[idx], feature_names, X[idx])
-    print("\nSample Patient Report:")
-    print(report)
+    print("Generating SHAP explanations...")
+    shap_vals = explain_tree_model(model, X_test, feature_names, save_dir)
+    print("Saving rankings to JSON...")
+    generate_json_rankings(shap_vals, X_test, test_df, feature_names, save_dir)
+    print("Explainability complete.")
 
 if __name__ == "__main__":
     main()

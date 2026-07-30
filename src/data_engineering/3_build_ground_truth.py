@@ -32,7 +32,7 @@ def main():
         stay_id, 
         charttime AS event_time, 
         'chartevent_swallow' AS label_type, 
-        value AS label_value
+        CAST(valuenum AS VARCHAR) AS label_value
     FROM read_csv_auto('{CHARTEVENTS_PATH}')
     WHERE itemid = 225118
     """
