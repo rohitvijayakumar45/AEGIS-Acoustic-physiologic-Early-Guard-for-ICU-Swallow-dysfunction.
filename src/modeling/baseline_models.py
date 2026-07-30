@@ -18,8 +18,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
-    confusion_matrix,
-    f1_score,
     roc_auc_score,
 )
 from sklearn.model_selection import GroupKFold
@@ -57,29 +55,49 @@ def load_and_prep_data(max_rows=None):
     logger.info("Join data.")
     # Assuming labels have stay_id, event_time, event_type
     # Assuming features have stay_id, window_end_time
+    import duckdb
     
-    # Dummy logic to handle joining since actual formats aren't fully specified
-    # We create a dummy target column if it fails or simulate the join
-    # Real join logic based on prompt:
-    # "Join features with labels using stay_id + temporal proximity (label event within 4h of window)"
+    conn = duckdb.connect()
+    conn.register("features_df", features_df)
+    conn.register("labels_df", labels_df)
+    conn.register("splits_df", splits_df)
     
-    # Convert times if needed, assuming they are datetime
-    if "window_end" in features_df.columns:
-        features_df["window_end"] = pd.to_datetime(features_df["window_end"])
-    if "event_time" in labels_df.columns:
-        labels_df["event_time"] = pd.to_datetime(labels_df["event_time"])
-        
-    # For now, simulate the target column 'target' to keep code running if real join is complex
-    if "target" not in features_df.columns:
-        # Pseudo join: 
-        features_df["target"] = np.random.randint(0, 2, size=len(features_df))
-        
-    df = features_df.merge(splits_df, on="stay_id", how="inner")
+    # cohort to get intime
+    cohort_path = "C:/Users/rohit/MultiModal/AEGIS/data/processed/target_cohort.csv"
+    
+    query = f"""
+    WITH cohort AS (
+        SELECT stay_id, CAST(intime AS TIMESTAMP) as intime
+        FROM read_csv_auto('{cohort_path}')
+    ),
+    features_with_time AS (
+        SELECT f.*, 
+               c.intime + INTERVAL (f.win_id * 4) HOUR as window_end_time
+        FROM features_df f
+        JOIN cohort c ON f.stay_id = c.stay_id
+    ),
+    joined AS (
+        SELECT 
+            f.*,
+            s.split,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM labels_df l
+                WHERE l.stay_id = f.stay_id 
+                  AND TRY_CAST(l.event_time AS TIMESTAMP) >= f.window_end_time 
+                  AND TRY_CAST(l.event_time AS TIMESTAMP) <= f.window_end_time + INTERVAL 4 HOUR
+            ) THEN 1 ELSE 0 END as target
+        FROM features_with_time f
+        JOIN splits_df s ON f.stay_id = s.stay_id
+    )
+    SELECT * FROM joined
+    """
+    
+    df = conn.execute(query).df()
     
     # Feature columns
     feature_cols = [
         col for col in df.columns 
-        if col.endswith(("_mean", "_min_val", "_max_val", "_std", "_slope"))
+        if col.endswith(("_mean", "_min_val", "_max_val", "_std", "_slope", "_obs_count"))
     ]
     derived_flags = ["spo2_drop_flag", "tachypnea_flag", "bradycardia_flag", "fever_flag"]
     feature_cols.extend([col for col in derived_flags if col in df.columns])
@@ -87,16 +105,14 @@ def load_and_prep_data(max_rows=None):
     # Fill missing values
     df[feature_cols] = df[feature_cols].fillna(0)
     
-    train_df = df[df["split"] == "train"]
-    val_df = df[df["split"] == "val"]
-    test_df = df[df["split"] == "test"]
+    train_df = df[df["split"] == "train"].copy()
+    val_df = df[df["split"] == "val"].copy()
+    test_df = df[df["split"] == "test"].copy()
     
     return train_df, val_df, test_df, feature_cols
 
 
-def evaluate_model(y_true, y_prob, threshold=0.5):
-    y_pred = (y_prob >= threshold).astype(int)
-    
+def evaluate_model(y_true, y_prob, stay_ids=None, split=None, model_name=None):
     try:
         auroc = roc_auc_score(y_true, y_prob)
     except ValueError:
@@ -108,20 +124,41 @@ def evaluate_model(y_true, y_prob, threshold=0.5):
         auprc = 0.0
         
     brier = brier_score_loss(y_true, y_prob)
-    f1 = f1_score(y_true, y_pred)
     
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    if stay_ids is not None and split is not None and model_name is not None:
+        raw_df = pd.DataFrame({
+            "stay_id": stay_ids,
+            "split": split,
+            "model_name": model_name,
+            "y_true": y_true,
+            "y_prob": y_prob
+        })
+        out_path = Path("C:/Users/rohit/MultiModal/AEGIS/data/processed/raw_predictions.parquet")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if out_path.exists():
+            existing_df = pd.read_parquet(out_path)
+            raw_df = pd.concat([existing_df, raw_df], ignore_index=True)
+            
+        raw_df.to_parquet(out_path, index=False)
     
     return {
         "AUROC": float(auroc),
         "AUPRC": float(auprc),
-        "Sensitivity": float(sensitivity),
-        "Specificity": float(specificity),
-        "F1": float(f1),
         "Brier": float(brier)
     }
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        bce = nn.BCELoss(reduction='none')(inputs, targets)
+        p_t = torch.exp(-bce)
+        loss = self.alpha * (1 - p_t)**self.gamma * bce
+        return loss.mean()
 
 
 def heuristic_baseline(df):
@@ -158,7 +195,7 @@ def optimize_xgboost(X_train, y_train, groups, n_trials=20):
             "eval_metric": "auc",
             "tree_method": "hist",
             "random_state": SEED,
-            "scale_pos_weight": scale_pos_weight,
+            "scale_pos_weight": trial.suggest_categorical("scale_pos_weight", [1, 2, 5, 10, 20, 40, 60, 80]),
             "max_depth": trial.suggest_int("max_depth", 3, 9),
             "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.1, log=True),
             "n_estimators": trial.suggest_int("n_estimators", 50, 300),
@@ -211,7 +248,7 @@ def optimize_lightgbm(X_train, y_train, groups, n_trials=20):
             "objective": "binary",
             "metric": "auc",
             "random_state": SEED,
-            "scale_pos_weight": scale_pos_weight,
+            "scale_pos_weight": trial.suggest_categorical("scale_pos_weight", [1, 2, 5, 10, 20, 40, 60, 80]),
             "verbose": -1,
             "num_leaves": trial.suggest_int("num_leaves", 15, 63),
             "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.1, log=True),
@@ -260,7 +297,7 @@ class SequenceDataset(Dataset):
         self.samples = []
         grouped = df.groupby("stay_id")
         
-        for _, group in grouped:
+        for stay_id, group in grouped:
             # Sort by time if window column exists
             if "window" in group.columns:
                 group = group.sort_values("window")
@@ -277,7 +314,7 @@ class SequenceDataset(Dataset):
                 features = np.pad(features, ((0, pad_len), (0, 0)), mode="constant")
                 targets = np.pad(targets, (0, pad_len), mode="constant")
                 
-            self.samples.append((torch.tensor(features, dtype=torch.float32), torch.tensor(targets, dtype=torch.float32)))
+            self.samples.append((torch.tensor(features, dtype=torch.float32), torch.tensor(targets, dtype=torch.float32), stay_id))
             
     def __len__(self):
         return len(self.samples)
@@ -362,16 +399,19 @@ class TCNModel(nn.Module):
         return torch.sigmoid(out).squeeze(-1)
 
 
-def train_dl_model(model, train_loader, val_loader, epochs=10, pos_weight=1.0):
+def train_dl_model(model, train_loader, val_loader, epochs=10, pos_weight=1.0, use_focal=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    criterion = nn.BCELoss(weight=torch.tensor([pos_weight]).to(device))
+    if use_focal:
+        criterion = FocalLoss(alpha=0.25, gamma=2.0).to(device)
+    else:
+        criterion = nn.BCELoss(weight=torch.tensor([pos_weight]).to(device))
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
     for epoch in range(epochs):
         model.train()
-        for X_batch, y_batch in train_loader:
+        for X_batch, y_batch, _ in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
             optimizer.zero_grad()
@@ -392,16 +432,21 @@ def evaluate_dl_model(model, test_loader):
     
     all_preds = []
     all_targets = []
+    all_stay_ids = []
     
     with torch.no_grad():
-        for X_batch, y_batch in test_loader:
+        for X_batch, y_batch, stay_ids_batch in test_loader:
             X_batch = X_batch.to(device)
             preds = model(X_batch)
             
             all_preds.append(preds.cpu().numpy().flatten())
             all_targets.append(y_batch.numpy().flatten())
             
-    return np.concatenate(all_preds), np.concatenate(all_targets)
+            batch_size, seq_len = preds.shape
+            for sid in stay_ids_batch:
+                all_stay_ids.extend([sid] * seq_len)
+            
+    return np.concatenate(all_preds), np.concatenate(all_targets), np.array(all_stay_ids)
 
 
 def main(max_rows=None, epochs=10, n_trials=20):
@@ -416,27 +461,45 @@ def main(max_rows=None, epochs=10, n_trials=20):
     X_test = test_df[feature_cols]
     y_test = test_df["target"].values
     
+    X_val = val_df[feature_cols]
+    y_val = val_df["target"].values
+    
+    # Optional: Clear old predictions file to start fresh for this run
+    raw_path = Path("C:/Users/rohit/MultiModal/AEGIS/data/processed/raw_predictions.parquet")
+    if raw_path.exists():
+        raw_path.unlink()
+
     results = {}
     
     # 1. Heuristic
+    preds_heuristic_val = heuristic_baseline(val_df)
+    evaluate_model(y_val, preds_heuristic_val, val_df["stay_id"].values, "val", "Heuristic")
     preds_heuristic = heuristic_baseline(test_df)
-    results["Heuristic"] = evaluate_model(y_test, preds_heuristic)
+    results["Heuristic"] = evaluate_model(y_test, preds_heuristic, test_df["stay_id"].values, "test", "Heuristic")
     
     # 2. Logistic Regression
+    preds_lr_val = train_logistic_regression(X_train, y_train, X_val)
+    evaluate_model(y_val, preds_lr_val, val_df["stay_id"].values, "val", "Logistic Regression")
     preds_lr = train_logistic_regression(X_train, y_train, X_test)
-    results["Logistic Regression"] = evaluate_model(y_test, preds_lr)
+    results["Logistic Regression"] = evaluate_model(y_test, preds_lr, test_df["stay_id"].values, "test", "Logistic Regression")
     
     # 3. Random Forest
+    preds_rf_val = train_random_forest(X_train, y_train, X_val)
+    evaluate_model(y_val, preds_rf_val, val_df["stay_id"].values, "val", "Random Forest")
     preds_rf = train_random_forest(X_train, y_train, X_test)
-    results["Random Forest"] = evaluate_model(y_test, preds_rf)
+    results["Random Forest"] = evaluate_model(y_test, preds_rf, test_df["stay_id"].values, "test", "Random Forest")
     
     # 4. XGBoost
+    preds_xgb_val = train_xgboost(X_train, y_train, groups_train, X_val, n_trials)
+    evaluate_model(y_val, preds_xgb_val, val_df["stay_id"].values, "val", "XGBoost")
     preds_xgb = train_xgboost(X_train, y_train, groups_train, X_test, n_trials)
-    results["XGBoost"] = evaluate_model(y_test, preds_xgb)
+    results["XGBoost"] = evaluate_model(y_test, preds_xgb, test_df["stay_id"].values, "test", "XGBoost")
     
     # 5. LightGBM
+    preds_lgb_val = train_lightgbm(X_train, y_train, groups_train, X_val, n_trials)
+    evaluate_model(y_val, preds_lgb_val, val_df["stay_id"].values, "val", "LightGBM")
     preds_lgb = train_lightgbm(X_train, y_train, groups_train, X_test, n_trials)
-    results["LightGBM"] = evaluate_model(y_test, preds_lgb)
+    results["LightGBM"] = evaluate_model(y_test, preds_lgb, test_df["stay_id"].values, "test", "LightGBM")
     
     # DL Data Prep
     train_dataset = SequenceDataset(train_df, feature_cols)
@@ -449,19 +512,23 @@ def main(max_rows=None, epochs=10, n_trials=20):
     
     pos_weight = (len(y_train) - sum(y_train)) / sum(y_train) if sum(y_train) > 0 else 1.0
     
+    # Helper to train and evaluate DL models on val and test
+    def run_dl(name, model, use_focal=False):
+        logger.info(f"Train {name}.")
+        trained = train_dl_model(model, train_loader, val_loader, epochs, pos_weight, use_focal=use_focal)
+        preds_val, y_val_dl, stay_ids_val = evaluate_dl_model(trained, val_loader)
+        evaluate_model(y_val_dl, preds_val, stay_ids_val, "val", name)
+        
+        preds_test, y_test_dl, stay_ids_test = evaluate_dl_model(trained, test_loader)
+        results[name] = evaluate_model(y_test_dl, preds_test, stay_ids_test, "test", name)
+
     # 6. LSTM
-    logger.info("Train LSTM.")
     lstm_model = LSTMModel(input_dim=len(feature_cols))
-    lstm_model = train_dl_model(lstm_model, train_loader, val_loader, epochs, pos_weight)
-    preds_lstm, y_test_dl = evaluate_dl_model(lstm_model, test_loader)
-    results["LSTM"] = evaluate_model(y_test_dl, preds_lstm)
+    run_dl("LSTM", lstm_model, use_focal=True)
     
     # 7. TCN
-    logger.info("Train TCN.")
     tcn_model = TCNModel(input_size=len(feature_cols), num_channels=[64, 64, 64])
-    tcn_model = train_dl_model(tcn_model, train_loader, val_loader, epochs, pos_weight)
-    preds_tcn, _ = evaluate_dl_model(tcn_model, test_loader)
-    results["TCN"] = evaluate_model(y_test_dl, preds_tcn)
+    run_dl("TCN", tcn_model, use_focal=True)
     
     # Save results
     out_dir = DATA_DIR / "models"
