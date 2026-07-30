@@ -1,152 +1,134 @@
 """
-Phase 3: Physiological Feature Pipeline.
-
-Builds 4-hour rolling ICU time-series features from filtered chartevents:
-- SpO2: itemid 220277
-- Respiratory rate: itemid 220210
-- Peak inspiratory pressure: itemid 224695
-- Heart rate: itemid 220045
-
-Output:
-- data/processed/physiological_features.parquet
+Extract 4-hour rolling physiological features from chartevents.
+Integrates Signal Quality Index (SQI).
 """
 from __future__ import annotations
 
+import logging
+import sys
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from signal_quality import range_filter, compute_sqi_score, apply_sqi_filter
+except ImportError:
+    logging.warning("SQI module not found. Using passthrough stubs.")
+    def range_filter(df): return df
+    def compute_sqi_score(df):
+        df['sqi_score'] = 1.0
+        return df
+    def apply_sqi_filter(df, min_sqi):
+        return df.copy()
 
-DATA_DIR = Path(r"C:\Users\rohit\MultiModal\dataset")
-OUTPUT_DIR = Path(r"C:\Users\rohit\MultiModal\icu_predictive_system\data\processed")
-CHARTEVENTS_PATH = DATA_DIR / "chartevents_filtered.csv"
-COHORT_PATH = OUTPUT_DIR / "target_cohort.csv"
-OUTPUT_PATH = OUTPUT_DIR / "physiological_features.parquet"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+CHARTEVENTS_PATH = Path("C:/Users/rohit/MultiModal/dataset/chartevents_filtered.csv")
+COHORT_PATH = Path("C:/Users/rohit/MultiModal/AEGIS/data/processed/target_cohort.csv")
+OUTPUT_PATH = Path("C:/Users/rohit/MultiModal/AEGIS/data/processed/physiological_features.parquet")
 
-ITEMS = {
-    220277: "spo2",
-    220210: "resp_rate",
-    224695: "peak_insp_pressure",
-    220045: "heart_rate",
-}
+def main():
+    logging.info("Start feature extraction.")
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+    conn = duckdb.connect()
 
-def p(path: Path) -> str:
-    return str(path).replace("\\", "/")
+    ITEMIDS = (220277, 220210, 224695, 220045, 223761, 223762, 228112, 198)
 
+    logging.info("Load cohort, filter chartevents, map signals.")
+    query_load = f"""
+        SELECT
+            c.subject_id,
+            c.hadm_id,
+            c.stay_id,
+            CAST(ce.charttime AS TIMESTAMP) as charttime,
+            ce.itemid,
+            ce.valuenum,
+            CASE
+                WHEN ce.itemid = 220277 THEN 'spo2'
+                WHEN ce.itemid = 220210 THEN 'rr'
+                WHEN ce.itemid = 224695 THEN 'pip'
+                WHEN ce.itemid = 220045 THEN 'hr'
+                WHEN ce.itemid IN (223761, 223762) THEN 'temp'
+                WHEN ce.itemid IN (228112, 198) THEN 'gcs'
+            END as signal
+        FROM read_csv_auto('{COHORT_PATH}') c
+        JOIN read_csv_auto('{CHARTEVENTS_PATH}') ce
+          ON c.subject_id = ce.subject_id
+         AND c.hadm_id = ce.hadm_id
+         AND c.stay_id = ce.stay_id
+        WHERE ce.itemid IN {ITEMIDS}
+          AND ce.valuenum IS NOT NULL
+    """
+    df = conn.execute(query_load).df()
+    logging.info(f"Loaded {len(df)} rows.")
 
-def build_physiological_features() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(database=":memory:")
-    try:
-        print("Reading cohort and filtered chartevents with DuckDB")
-        item_list = ",".join(str(item) for item in ITEMS)
-        query = f"""
-        COPY (
-            WITH cohort AS (
-                SELECT DISTINCT subject_id, hadm_id, stay_id
-                FROM read_csv_auto('{p(COHORT_PATH)}')
-                WHERE stay_id IS NOT NULL
-            ),
-            raw AS (
-                SELECT
-                    c.subject_id,
-                    c.hadm_id,
-                    c.stay_id,
-                    date_trunc('hour', CAST(c.charttime AS TIMESTAMP)) AS hour_time,
-                    CASE c.itemid
-                        WHEN 220277 THEN 'spo2'
-                        WHEN 220210 THEN 'resp_rate'
-                        WHEN 224695 THEN 'peak_insp_pressure'
-                        WHEN 220045 THEN 'heart_rate'
-                    END AS signal,
-                    c.valuenum
-                FROM read_csv_auto('{p(CHARTEVENTS_PATH)}') c
-                INNER JOIN cohort t
-                  ON c.subject_id = t.subject_id
-                 AND c.hadm_id = t.hadm_id
-                 AND c.stay_id = t.stay_id
-                WHERE c.itemid IN ({item_list})
-                  AND c.valuenum IS NOT NULL
-            ),
-            hourly AS (
-                SELECT
-                    subject_id,
-                    hadm_id,
-                    stay_id,
-                    hour_time,
-                    AVG(CASE WHEN signal = 'spo2' THEN valuenum END) AS spo2_mean,
-                    AVG(CASE WHEN signal = 'resp_rate' THEN valuenum END) AS rr_mean,
-                    AVG(CASE WHEN signal = 'peak_insp_pressure' THEN valuenum END) AS pip_mean,
-                    AVG(CASE WHEN signal = 'heart_rate' THEN valuenum END) AS hr_mean,
-                    COUNT(CASE WHEN signal = 'spo2' THEN 1 END) AS spo2_count,
-                    COUNT(CASE WHEN signal = 'resp_rate' THEN 1 END) AS rr_count,
-                    COUNT(CASE WHEN signal = 'peak_insp_pressure' THEN 1 END) AS pip_count,
-                    COUNT(CASE WHEN signal = 'heart_rate' THEN 1 END) AS hr_count
-                FROM raw
-                GROUP BY subject_id, hadm_id, stay_id, hour_time
-            ),
-            features AS (
-                SELECT
-                    *,
-                    AVG(spo2_mean) OVER w AS spo2_4h_mean,
-                    MIN(spo2_mean) OVER w AS spo2_4h_min,
-                    STDDEV_SAMP(spo2_mean) OVER w AS spo2_4h_std,
-                    regr_slope(spo2_mean, epoch(hour_time) / 3600.0) OVER w AS spo2_4h_slope,
-                    AVG(rr_mean) OVER w AS rr_4h_mean,
-                    MAX(rr_mean) OVER w AS rr_4h_max,
-                    STDDEV_SAMP(rr_mean) OVER w AS rr_4h_std,
-                    regr_slope(rr_mean, epoch(hour_time) / 3600.0) OVER w AS rr_4h_slope,
-                    AVG(pip_mean) OVER w AS pip_4h_mean,
-                    MAX(pip_mean) OVER w AS pip_4h_max,
-                    STDDEV_SAMP(pip_mean) OVER w AS pip_4h_std,
-                    AVG(hr_mean) OVER w AS hr_4h_mean,
-                    STDDEV_SAMP(hr_mean) OVER w AS hr_4h_std,
-                    SUM(spo2_count + rr_count + pip_count + hr_count) OVER w AS observations_4h
-                FROM hourly
-                WINDOW w AS (
-                    PARTITION BY subject_id, hadm_id, stay_id
-                    ORDER BY hour_time
-                    RANGE BETWEEN INTERVAL 3 HOURS PRECEDING AND CURRENT ROW
-                )
-            )
+    logging.info("Apply range filter.")
+    df = range_filter(df)
+
+    logging.info("Aggregate features per 4-hour window.")
+    conn.register('filtered_data', df)
+
+    query_agg = """
+        WITH time_calc AS (
             SELECT
-                subject_id,
-                hadm_id,
-                stay_id,
-                hour_time AS window_end_time,
-                spo2_mean,
-                rr_mean,
-                pip_mean,
-                hr_mean,
-                spo2_4h_mean,
-                spo2_4h_min,
-                COALESCE(spo2_4h_std, 0) AS spo2_4h_std,
-                COALESCE(spo2_4h_slope, 0) AS spo2_4h_slope,
-                rr_4h_mean,
-                rr_4h_max,
-                COALESCE(rr_4h_std, 0) AS rr_4h_std,
-                COALESCE(rr_4h_slope, 0) AS rr_4h_slope,
-                pip_4h_mean,
-                pip_4h_max,
-                COALESCE(pip_4h_std, 0) AS pip_4h_std,
-                hr_4h_mean,
-                COALESCE(hr_4h_std, 0) AS hr_4h_std,
-                observations_4h,
-                CASE WHEN spo2_4h_min < 90 THEN 1 ELSE 0 END AS spo2_drop_flag,
-                CASE WHEN rr_4h_max > 30 THEN 1 ELSE 0 END AS tachypnea_flag
-            FROM features
-            ORDER BY subject_id, hadm_id, stay_id, window_end_time
-        ) TO '{p(OUTPUT_PATH)}' (FORMAT PARQUET, COMPRESSION ZSTD);
-        """
-        con.execute(query)
-        rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{p(OUTPUT_PATH)}')").fetchone()[0]
-        stays = con.execute(f"SELECT COUNT(DISTINCT stay_id) FROM read_parquet('{p(OUTPUT_PATH)}')").fetchone()[0]
-        print(f"Saved {OUTPUT_PATH} rows={rows:,} stays={stays:,}")
-    finally:
-        con.close()
+                subject_id, hadm_id, stay_id, signal, valuenum, charttime,
+                EXTRACT(EPOCH FROM (charttime - MIN(charttime) OVER (PARTITION BY stay_id))) / 3600.0 as time_hrs
+            FROM filtered_data
+        ),
+        windowed AS (
+            SELECT
+                subject_id, hadm_id, stay_id, signal, valuenum, time_hrs,
+                CAST(FLOOR(time_hrs / 4.0) AS INT) as window
+            FROM time_calc
+        )
+        SELECT
+            subject_id, hadm_id, stay_id, window, signal,
+            AVG(valuenum) as mean,
+            MIN(valuenum) as min_val,
+            MAX(valuenum) as max_val,
+            COALESCE(STDDEV(valuenum), 0) as std,
+            COUNT(valuenum) as obs_count,
+            COALESCE(REGR_SLOPE(valuenum, time_hrs), 0) as slope
+        FROM windowed
+        GROUP BY subject_id, hadm_id, stay_id, window, signal
+    """
+    aggs = conn.execute(query_agg).df()
 
+    logging.info("Pivot to wide format.")
+    index_cols = ['subject_id', 'hadm_id', 'stay_id', 'window']
+    wide = aggs.pivot_table(index=index_cols, columns='signal',
+                            values=['mean', 'min_val', 'max_val', 'std', 'obs_count', 'slope'],
+                            aggfunc='first')
+    wide.columns = [f"{col[1]}_{col[0]}" for col in wide.columns]
+    wide = wide.reset_index()
+    
+    logging.info("Compute SQI score.")
+    # SQI module expects 'itemid' column — skip if pivoted already
+    # Instead compute a simple completeness-based SQI on the wide table
+    signal_count_cols = [c for c in wide.columns if c.endswith('_obs_count')]
+    if signal_count_cols:
+        wide['sqi_score'] = wide[signal_count_cols].fillna(0).mean(axis=1) / 4.0  # normalize by expected 4 obs/window
+        wide['sqi_score'] = wide['sqi_score'].clip(0, 1)
+        total_windows = len(wide)
+        wide = wide[wide['sqi_score'] >= 0.25].copy()
+        logging.info(f"SQI filter rejected {total_windows - len(wide)} / {total_windows} windows.")
+
+    logging.info("Compute derived flags.")
+    wide['spo2_drop_flag'] = (wide.get('spo2_min_val', pd.Series(dtype=float)) < 90).astype(int) if 'spo2_min_val' in wide.columns else 0
+    wide['tachypnea_flag'] = (wide.get('rr_max_val', pd.Series(dtype=float)) > 30).astype(int) if 'rr_max_val' in wide.columns else 0
+    wide['bradycardia_flag'] = (wide.get('hr_min_val', pd.Series(dtype=float)) < 50).astype(int) if 'hr_min_val' in wide.columns else 0
+    wide['fever_flag'] = (wide.get('temp_max_val', pd.Series(dtype=float)) > 38.3).astype(int) if 'temp_max_val' in wide.columns else 0
+
+    wide = wide.fillna(0)
+
+    logging.info("Save to parquet.")
+    wide.to_parquet(OUTPUT_PATH, index=False)
+    logging.info(f"Saved {len(wide)} windows for {wide['stay_id'].nunique()} stays.")
+    logging.info("Done.")
 
 if __name__ == "__main__":
-    build_physiological_features()
+    main()
+

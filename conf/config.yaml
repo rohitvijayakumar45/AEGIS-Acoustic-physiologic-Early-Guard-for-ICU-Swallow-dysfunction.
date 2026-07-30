@@ -1,0 +1,25 @@
+project:
+  name: AEGIS
+  root: C:/Users/rohit/MultiModal/AEGIS
+  data_dir: C:/Users/rohit/MultiModal/dataset
+  processed_dir: C:/Users/rohit/MultiModal/AEGIS/data/processed
+  model_dir: C:/Users/rohit/MultiModal/AEGIS/data/models
+  seed: 42
+
+data:
+  chartevents_path: C:/Users/rohit/MultiModal/dataset/chartevents_filtered.csv
+  cohort_path: C:/Users/rohit/MultiModal/AEGIS/data/processed/target_cohort.csv
+
+sqi:
+  spo2_range: [50, 100]
+  hr_range: [20, 250]
+  rr_range: [4, 60]
+  pip_range: [0, 60]
+  flatline_std_threshold: 0.01
+  missing_rate_threshold: 0.5
+  min_observations_per_window: 2
+
+split:
+  train_years: [2014, 2015, 2016, 2017]
+  val_years: [2018]
+  test_years: [2019]
